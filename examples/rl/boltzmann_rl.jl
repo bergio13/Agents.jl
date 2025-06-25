@@ -63,6 +63,7 @@ function boltz_step!(agent::BoltzmannAgent, model::ABM, action::Int)
         end
     end
 end
+
 ## 4. Represent the state of the environment
 struct BoltzmannState
     agent_wealths::Vector{Int}
@@ -154,19 +155,10 @@ function boltz_model_step!(model::ABM)
     model.step_count += 1
 end
 
-## 6. Implement POMDPs.jl Interface for BoltzmannEnv
-
-# Define the observation space size for Crux (n_agents * 3: wealth, x, y)
-#function POMDPs.observations(env::BoltzmannEnv, s::BoltzmannState)
-#    obs_vec = vcat(s.agent_wealths, collect(Iterators.flatten(s.agent_positions))...)
-#    return obs_vec
-#end
-
+## 6. POMDPs Interface for BoltzmannEnv
 const NUM_INDIVIDUAL_ACTIONS = 5 # Stay, N, S, E, W
 
 function POMDPs.actions(env::BoltzmannEnv)
-    #individual_actions = 1:NUM_INDIVIDUAL_ACTIONS
-    #return collect(Iterators.product(fill(individual_actions, env.num_agents)...))
     return 1:(NUM_INDIVIDUAL_ACTIONS^env.num_agents)
 end
 
@@ -202,7 +194,7 @@ end
 function POMDPs.reward(env::BoltzmannEnv, s, a::Vector{Int}, sp)
     reward = 0.0
     new_gini = sp[end] # Last element is the Gini coefficient
-    prev_gini = s[end] # Last element of the previous state
+    prev_gini = s[end]
 
     if new_gini < prev_gini
         reward = (prev_gini - new_gini) * 20.0
@@ -255,37 +247,30 @@ function POMDPs.gen(env::BoltzmannEnv, state, action_idx::Int, rng::AbstractRNG)
     return (sp=next_state, r=r)
 end
 
-Crux.state_space(env::BoltzmannEnv) = Crux.ContinuousSpace((env.num_agents * 3 + 2,)) # 3 values per agent: wealth, x, y + gini
-POMDPs.discount(env::BoltzmannEnv) = 0.99 # Discount factor
+# Define the state space and discount factor
+Crux.state_space(env::BoltzmannEnv) = Crux.ContinuousSpace((env.num_agents * 3 + 2,)) # 3 values per agent: wealth, x, y + gini and step
+
+# Define the discount factor
+POMDPs.discount(env::BoltzmannEnv) = 0.99
 
 
 # Setup the environment
-N_AGENTS = 6
+N_AGENTS = 5
 env_mdp = BoltzmannEnv(num_agents=N_AGENTS, dims=(5, 5), initial_wealth=1, max_steps=100)
 
-POMDPs.actions(env_mdp)
-length(POMDPs.actions(env_mdp))
-rand(POMDPs.actions(env_mdp))
-
 S = Crux.state_space(env_mdp)
-Crux.dim(S)[1]
 output_size = length(POMDPs.actions(env_mdp))
 as = [POMDPs.actions(env_mdp)...]
 
 
-
-QS() = DiscreteNetwork(
-    Chain(
-        Dense(Crux.dim(S)[1], 64, relu),
-        Dense(64, 64, relu),
-        Dense(64, output_size)
-    ), as)
+# DQN Setup
+QS() = DiscreteNetwork(Chain(Dense(Crux.dim(S)[1], 64, relu), Dense(64, 64, relu), Dense(64, output_size)), as)
 
 solver = DQN(π=QS(), S=Crux.state_space(env_mdp), N=100_000, buffer_size=1000, buffer_init=1000)
 policy = solve(solver, env_mdp)
 plot_learning(solver)
 
-
+# PPO Setup
 V() = ContinuousNetwork(Chain(Dense(Crux.dim(S)..., 64, relu), Dense(64, 64, relu), Dense(64, 1)))
 B() = DiscreteNetwork(Chain(Dense(Crux.dim(S)..., 64, relu), Dense(64, 64, relu), Dense(64, length(as))), as)
 
