@@ -182,7 +182,7 @@ function get_local_observation(model::ABM, agent_id::Int, observation_radius::In
     # 2 channels: occupancy and relative wealth
     neighborhood_grid = zeros(Float32, grid_size, grid_size, 2)
 
-    # Get all agents in the neighborhood (more efficient)
+    # Get all agents in the neighborhood
     neighbor_ids = nearby_ids(target_agent, model, observation_radius)
 
     for neighbor in [model[id] for id in neighbor_ids]
@@ -258,8 +258,6 @@ function POMDPs.observation(env::BoltzmannEnv, s::Vector{Float32})
 
     # Convert local observation to vector
     obs_vec = observation_to_vector(local_obs)
-
-    # Return as Dirac distribution
     return obs_vec
 end
 
@@ -268,7 +266,7 @@ function POMDPs.initialstate(env::BoltzmannEnv)
     env.abm_model = boltzmann_money_model_rl_init(
         num_agents=env.num_agents,
         dims=env.dims,
-        seed=rand(env.rng, Int),
+        seed=1234,
         initial_wealth=env.initial_wealth
     )
     return Dirac(state_to_vector(model_to_state(env.abm_model, 0)))
@@ -338,9 +336,9 @@ POMDPs.discount(env::BoltzmannEnv) = 0.99 # Discount factor
 
 
 # Setup the environment
-N_AGENTS = 5
+N_AGENTS = 10
 OBS_RADIUS = 2
-env_mdp = BoltzmannEnv(num_agents=N_AGENTS, dims=(10, 10), initial_wealth=10, max_steps=200, observation_radius=OBS_RADIUS)
+env_mdp = BoltzmannEnv(num_agents=N_AGENTS, dims=(10, 10), initial_wealth=10, max_steps=50, observation_radius=OBS_RADIUS)
 
 
 S = Crux.state_space(env_mdp)
@@ -351,9 +349,9 @@ O = observations(env_mdp)
 
 QS() = DiscreteNetwork(
     Chain(
-        Dense(Crux.dim(O)[1], 64, relu),
-        Dense(64, 64, relu),
-        Dense(64, output_size)
+        Dense(Crux.dim(O)[1], 128, relu),
+        Dense(128, 128, relu),
+        Dense(128, output_size)
     ), as)
 
 solver = DQN(π=QS(), S=O, N=200_000, buffer_size=10000, buffer_init=1000, ΔN=50)
