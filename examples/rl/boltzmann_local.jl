@@ -1,5 +1,4 @@
-using Agents, Random, CairoMakie
-using POMDPs, Crux, Flux, Distributions
+using Agents, Random, CairoMakie, POMDPs, Crux, Flux, Distributions
 
 ## 1. Agent Definition 
 @agent struct BoltzmannAgent(GridAgent{2})
@@ -75,8 +74,9 @@ end
 
 # Helper to convert model to BoltzmannState
 function model_to_state(model::ABM, step_count::Int)
-    wealths = [a.wealth for a in allagents(model)]
-    positions = [a.pos for a in allagents(model)]
+    sorted_agents = sort(collect(allagents(model)); by=a -> a.id)
+    wealths = [a.wealth for a in sorted_agents]
+    positions = [a.pos for a in sorted_agents]
     current_gini = gini(wealths)
     return BoltzmannState(wealths, positions, step_count, current_gini)
 end
@@ -147,7 +147,7 @@ function boltzmann_money_model_rl_init(; num_agents=100, dims=(10, 10), seed=123
     )
 
     for _ in 1:num_agents
-        add_agent_single!(BoltzmannAgent, model, rand(1:initial_wealth))
+        add_agent_single!(BoltzmannAgent, model, rand(rng, 1:initial_wealth))
     end
     wealths = [a.wealth for a in allagents(model)]
     model.gini_coefficient = gini(wealths)
@@ -164,79 +164,78 @@ end
 ## 4. Local Observation Structure
 struct LocalObservation
     agent_id::Int
-    own_wealth::Int
-    own_position::NTuple{2,Int}
-    occupancy_grid::Matrix{Bool}  # Binary grid showing occupied cells
+    normalized_wealth::Float32
+    normalized_pos::Tuple{Float32,Float32}
+    # Each cell in the neighborhood grid contains:
+    # 1. Occupancy (0.0 or 1.0)
+    # 2. Normalized relative wealth (wealth_other - wealth_self) / (wealth_other + wealth_self)
+    neighborhood_grid::Array{Float32,3}
 end
 
 # Helper to get neighborhood observation for a specific agent
-function get_local_observation(model::ABM, agent_id::Int, observation_radius::Int=2)
+function get_local_observation(model::ABM, agent_id::Int, observation_radius::Int)
     target_agent = model[agent_id]
     agent_pos = target_agent.pos
-
-    # Create occupancy grid
-    grid_size = 2 * observation_radius + 1
-    occupancy_grid = zeros(Bool, grid_size, grid_size)
-
-    # Get world dimensions for periodic boundary handling
     width, height = getfield(model, :space).extent
 
-    # Fill occupancy grid
-    for other_agent in allagents(model)
-        if other_agent.id == agent_id
-            continue  # Don't include self in occupancy grid
+    grid_size = 2 * observation_radius + 1
+    # 2 channels: occupancy and relative wealth
+    neighborhood_grid = zeros(Float32, grid_size, grid_size, 2)
+
+    # Get all agents in the neighborhood (more efficient)
+    neighbor_ids = nearby_ids(target_agent, model, observation_radius)
+
+    for neighbor in [model[id] for id in neighbor_ids]
+        if neighbor.id == agent_id
+            continue
         end
 
         # Calculate relative position with periodic boundaries
-        dx_raw = other_agent.pos[1] - agent_pos[1]
-        dy_raw = other_agent.pos[2] - agent_pos[2]
-
-        # Handle periodic boundaries
-        dx = dx_raw
-        if abs(dx_raw) > width / 2
-            dx = dx_raw - sign(dx_raw) * width
+        dx = neighbor.pos[1] - agent_pos[1]
+        dy = neighbor.pos[2] - agent_pos[2]
+        # Wrap around for periodic space
+        if abs(dx) > width / 2
+            dx -= sign(dx) * width
+        end
+        if abs(dy) > height / 2
+            dy -= sign(dy) * height
         end
 
-        dy = dy_raw
-        if abs(dy_raw) > height / 2
-            dy = dy_raw - sign(dy_raw) * height
-        end
+        # Convert to grid coordinates (center is at radius + 1)
+        grid_x = dx + observation_radius + 1
+        grid_y = dy + observation_radius + 1
 
-        # Check if within observation radius
-        if abs(dx) <= observation_radius && abs(dy) <= observation_radius
-            # Convert to grid coordinates (center is at observation_radius + 1)
-            grid_x = dx + observation_radius + 1
-            grid_y = dy + observation_radius + 1
-            occupancy_grid[grid_x, grid_y] = true
+        # Channel 1: Occupancy
+        neighborhood_grid[grid_x, grid_y, 1] = 1.0
+
+        # Channel 2: Normalized Relative Wealth
+        wealth_diff = Float32(neighbor.wealth - target_agent.wealth)
+        wealth_sum = Float32(neighbor.wealth + target_agent.wealth)
+        if wealth_sum > 0
+            neighborhood_grid[grid_x, grid_y, 2] = wealth_diff / wealth_sum
         end
     end
 
-    return LocalObservation(
-        agent_id,
-        target_agent.wealth,
-        agent_pos,
-        occupancy_grid
-    )
+    # Normalize own agent's data
+    total_wealth = sum(a.wealth for a in allagents(model))
+    normalized_wealth = total_wealth > 0 ? Float32(target_agent.wealth / total_wealth) : 0.0f0
+    normalized_pos = (Float32(agent_pos[1] / width), Float32(agent_pos[2] / height))
+
+    return LocalObservation(agent_id, normalized_wealth, normalized_pos, neighborhood_grid)
 end
 
 # Convert local observation to vector
-function observation_to_vector(obs::LocalObservation, observation_radius::Int)::Vector{Float32}
-    # Fixed size observation vector
-    grid_size = 2 * observation_radius + 1
-    total_grid_cells = grid_size * grid_size
+function observation_to_vector(obs::LocalObservation)::Vector{Float32}
+    # Flatten the 3D neighborhood grid
+    flattened_grid = vec(obs.neighborhood_grid)
 
-    # Format: [own_wealth, flattened_occupancy_grid...]
-    obs_size = 1 + total_grid_cells
-    obs_vec = zeros(Float32, obs_size)
-
-    # Own wealth
-    obs_vec[1] = Float32(obs.own_wealth)
-
-    # Flatten occupancy grid and add to observation
-    flattened_grid = reshape(obs.occupancy_grid, total_grid_cells)
-    obs_vec[2:1+total_grid_cells] = Float32.(flattened_grid)
-
-    return obs_vec
+    # Combine all normalized features into a single vector
+    return vcat(
+        obs.normalized_wealth,
+        obs.normalized_pos[1],
+        obs.normalized_pos[2],
+        flattened_grid
+    )
 end
 
 ## 6. Implement POMDPs.jl Interface for BoltzmannEnv
@@ -247,11 +246,10 @@ function POMDPs.actions(env::BoltzmannEnv)
 end
 
 function POMDPs.observations(env::BoltzmannEnv)
-    # Return a continuous space for observations
-    observation_radius = env.observation_radius
-    grid_size = 2 * observation_radius + 1
-    total_grid_cells = grid_size * grid_size
-    return Crux.ContinuousSpace((1 + total_grid_cells,), Float32)  # Own wealth + occupancy grid
+    grid_size = 2 * env.observation_radius + 1
+    # 1 (norm_wealth) + 2 (norm_pos) + grid_size * grid_size * 2 (occupancy + rel_wealth channels)
+    obs_dims = 3 + (grid_size^2 * 2)
+    return Crux.ContinuousSpace((obs_dims,), Float32)
 end
 
 function POMDPs.observation(env::BoltzmannEnv, s::Vector{Float32})
@@ -259,7 +257,7 @@ function POMDPs.observation(env::BoltzmannEnv, s::Vector{Float32})
     local_obs = get_local_observation(env.abm_model, env.current_agent_id, env.observation_radius)
 
     # Convert local observation to vector
-    obs_vec = observation_to_vector(local_obs, env.observation_radius)
+    obs_vec = observation_to_vector(local_obs)
 
     # Return as Dirac distribution
     return obs_vec
@@ -270,7 +268,7 @@ function POMDPs.initialstate(env::BoltzmannEnv)
     env.abm_model = boltzmann_money_model_rl_init(
         num_agents=env.num_agents,
         dims=env.dims,
-        seed=1234,
+        seed=rand(env.rng, Int),
         initial_wealth=env.initial_wealth
     )
     return Dirac(state_to_vector(model_to_state(env.abm_model, 0)))
@@ -340,14 +338,12 @@ POMDPs.discount(env::BoltzmannEnv) = 0.99 # Discount factor
 
 
 # Setup the environment
-N_AGENTS = 3
-env_mdp = BoltzmannEnv(num_agents=N_AGENTS, dims=(15, 15), initial_wealth=10, max_steps=50, gini_threshold=0.1)
+N_AGENTS = 5
+OBS_RADIUS = 2
+env_mdp = BoltzmannEnv(num_agents=N_AGENTS, dims=(10, 10), initial_wealth=10, max_steps=200, observation_radius=OBS_RADIUS)
 
-POMDPs.actions(env_mdp).vals
-length(POMDPs.actions(env_mdp).vals)
 
 S = Crux.state_space(env_mdp)
-Crux.dim(S)[1]
 output_size = length(POMDPs.actions(env_mdp).vals)
 as = POMDPs.actions(env_mdp).vals
 O = observations(env_mdp)
@@ -360,7 +356,7 @@ QS() = DiscreteNetwork(
         Dense(64, output_size)
     ), as)
 
-solver = DQN(π=QS(), S=O, N=200_000, buffer_size=10000, buffer_init=1000)
+solver = DQN(π=QS(), S=O, N=200_000, buffer_size=10000, buffer_init=1000, ΔN=50)
 policy = solve(solver, env_mdp)
 plot_learning(solver)
 
@@ -371,40 +367,3 @@ B() = DiscreteNetwork(Chain(Dense(Crux.dim(O)..., 64, relu), Dense(64, 64, relu)
 𝒮_ppo = PPO(π=ActorCritic(B(), V()), S=O, N=100_000, ΔN=200, log=(period=1000,))
 @time π_ppo = solve(𝒮_ppo, env_mdp)
 plot_learning(𝒮_ppo)
-
-function run_policy_in_abm(π, env::BoltzmannEnv; max_steps=50)
-    # Initialize the ABM from the env
-    abm = boltzmann_money_model_rl_init(
-        num_agents=env.num_agents,
-        dims=env.dims,
-        seed=1234,
-        initial_wealth=env.initial_wealth
-    )
-
-    for step in 1:max_steps
-        state_vec = state_to_vector(model_to_state(abm, step))
-        joint_action_idx = action(π, state_vec)
-
-        # Convert action index to joint action
-        joint_action = int_to_joint_action(joint_action_idx[1], env.num_agents)
-
-        agents_by_id = sort(collect(allagents(abm)), by=a -> a.id)
-        for (i, agent) in enumerate(agents_by_id)
-            boltz_step!(agent, abm, joint_action[i])
-        end
-
-        boltz_model_step!(abm)
-
-        println("Step $step | Gini: ", abm.gini_coefficient)
-
-        if abm.gini_coefficient < env.gini_threshold
-            println("Reached Gini threshold.")
-            break
-        end
-    end
-
-    return abm
-end
-
-# Run trained policy in a fresh ABM instance
-final_abm = run_policy_in_abm(π_ppo, env_mdp; max_steps=50)
