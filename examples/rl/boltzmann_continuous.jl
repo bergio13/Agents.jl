@@ -1,5 +1,4 @@
-using Agents, Random, CairoMakie
-using POMDPs, Crux, Flux, Distributions
+using Agents, Random, CairoMakie, POMDPs, Crux, Flux, Distributions
 
 ## 1. Agent Definition 
 @agent struct BoltzmannAgent(GridAgent{2})
@@ -75,8 +74,9 @@ end
 
 # Helper to convert model to BoltzmannState
 function model_to_state(model::ABM, step_count::Int)
-    wealths = [a.wealth for a in allagents(model)]
-    positions = [a.pos for a in allagents(model)]
+    sorted_agents = sort(collect(allagents(model)); by=a -> a.id)
+    wealths = [a.wealth for a in sorted_agents]
+    positions = [a.pos for a in sorted_agents]
     current_gini = gini(wealths)
     return BoltzmannState(wealths, positions, step_count, current_gini)
 end
@@ -102,7 +102,7 @@ function state_to_vector(s::BoltzmannState)::Vector{Float32}
 end
 
 ## 5. Custom MDP - Treating as single agent controlling all
-mutable struct BoltzmannEnv <: MDP{Vector{Float32},Vector{Int}}
+mutable struct BoltzmannEnv <: POMDP{Vector{Float32},Vector{Int},Vector{Float32}}
     abm_model::ABM
     num_agents::Int
     dims::Tuple{Int,Int}
@@ -166,6 +166,37 @@ function POMDPs.actions(env::BoltzmannEnv)
     return [collect(a) for a in Iterators.product(fill(1:NUM_INDIVIDUAL_ACTIONS, env.num_agents)...)]
 end
 
+function POMDPs.observation(env::BoltzmannEnv, s::Vector{Float32})
+    # s is the full, unnormalized state vector from state_to_vector
+    n_agents = env.num_agents
+
+    # Determine normalization parameters from the environment
+    max_possible_wealth = Float32(env.initial_wealth * env.num_agents) # Total wealth is conserved
+    min_possible_wealth = Float32(0) # Wealth can go to 0
+
+    max_x = Float32(env.dims[1])
+    min_x = Float32(1) # GridSpace is 1-indexed
+    max_y = Float32(env.dims[2])
+    min_y = Float32(1)
+
+    normalized_obs = Vector{Float32}(undef, n_agents * 3) # Observation excludes step_count and Gini
+
+    for i in 1:n_agents
+        idx = 3 * (i - 1) + 1
+
+        # Normalize wealth
+        normalized_obs[idx] = (s[idx] - min_possible_wealth) / (max_possible_wealth - min_possible_wealth)
+
+        # Normalize x position
+        normalized_obs[idx+1] = (s[idx+1] - min_x) / (max_x - min_x)
+
+        # Normalize y position
+        normalized_obs[idx+2] = (s[idx+2] - min_y) / (max_y - min_y)
+    end
+    return normalized_obs
+end
+
+
 # Define the initial state of the MDP
 function POMDPs.initialstate(env::BoltzmannEnv)
     env.abm_model = boltzmann_money_model_rl_init(
@@ -175,6 +206,11 @@ function POMDPs.initialstate(env::BoltzmannEnv)
         initial_wealth=env.initial_wealth
     )
     return Dirac(state_to_vector(model_to_state(env.abm_model, 0)))
+end
+
+function POMDPs.initialobs(env::BoltzmannEnv, initial_state)
+    obs = POMDPs.observation(env, initial_state)
+    return Dirac(obs)
 end
 
 # Define the transition function
@@ -191,6 +227,13 @@ function POMDPs.transition(env::BoltzmannEnv, s, a::Vector{Int})
     # Return the new state
     next_state = state_to_vector(model_to_state(env.abm_model, env.abm_model.step_count))
     return next_state
+end
+
+function POMDPs.gen(env::BoltzmannEnv, state, action::Vector{Int}, rng::AbstractRNG)
+    next_state = POMDPs.transition(env, state, action)
+    obs = POMDPs.observation(env, next_state)
+    r = POMDPs.reward(env, state, action, next_state)
+    return (sp=next_state, o=obs, r=r)
 end
 
 # Define the reward function 
@@ -220,18 +263,14 @@ function POMDPs.isterminal(env::BoltzmannEnv, s)
     s[end] < env.gini_threshold || s[end-1] >= env.max_steps
 end
 
-function POMDPs.gen(env::BoltzmannEnv, state, action::Vector{Int}, rng::AbstractRNG)
-    next_state = POMDPs.transition(env, state, action)
-    r = POMDPs.reward(env, state, action, next_state)
-    return (sp=next_state, r=r)
-end
 
 Crux.state_space(env::BoltzmannEnv) = Crux.ContinuousSpace((env.num_agents * 3 + 2,))
+POMDPs.observations(env::BoltzmannEnv) = Crux.ContinuousSpace((env.num_agents * 3,)) # Exclude step count and Gini from observations
 POMDPs.discount(env::BoltzmannEnv) = 0.99
 
 # Setup the environment
 N_AGENTS = 3
-env_mdp = BoltzmannEnv(num_agents=N_AGENTS, dims=(10, 10), initial_wealth=10, max_steps=100)
+env_mdp = BoltzmannEnv(num_agents=N_AGENTS, dims=(10, 10), initial_wealth=10, max_steps=50)
 
 S = Crux.state_space(env_mdp)
 
@@ -248,7 +287,7 @@ function continuous_to_discrete_actions(continuous_actions::Vector{Float32}, num
 end
 
 # Wrapper environment that converts between continuous and discrete actions
-mutable struct ContinuousBoltzmannEnv <: MDP{Vector{Float32},Vector{Float32}}
+mutable struct ContinuousBoltzmannEnv <: POMDP{Vector{Float32},Vector{Float32},Vector{Float32}}
     discrete_env::BoltzmannEnv
 end
 
@@ -258,6 +297,14 @@ end
 
 function POMDPs.initialstate(env::ContinuousBoltzmannEnv)
     return POMDPs.initialstate(env.discrete_env)
+end
+
+function POMDPs.initialobs(env::ContinuousBoltzmannEnv, initial_state)
+    return POMDPs.initialobs(env.discrete_env, initial_state)
+end
+
+function POMDPs.observation(env::ContinuousBoltzmannEnv, s::Vector{Float32})
+    return POMDPs.observation(env.discrete_env, s)
 end
 
 function POMDPs.transition(env::ContinuousBoltzmannEnv, s, a::Vector{Float32})
@@ -280,18 +327,21 @@ function POMDPs.gen(env::ContinuousBoltzmannEnv, state, action::Vector{Float32},
 end
 
 Crux.state_space(env::ContinuousBoltzmannEnv) = Crux.state_space(env.discrete_env)
+POMDPs.observations(env::ContinuousBoltzmannEnv) = POMDPs.observations(env.discrete_env)
 Crux.action_space(env::ContinuousBoltzmannEnv) = Crux.ContinuousSpace((env.discrete_env.num_agents,))
 POMDPs.discount(env::ContinuousBoltzmannEnv) = POMDPs.discount(env.discrete_env)
 
 # Create the continuous wrapper
 continuous_env = ContinuousBoltzmannEnv(env_mdp)
 
+O = POMDPs.observations(continuous_env)
+O.dims
+
 # PPO with continuous actions
-V() = ContinuousNetwork(Chain(Dense(Crux.dim(S)..., 128, relu), Dense(128, 64, relu), Dense(64, 1)))
-SG() = GaussianPolicy(ContinuousNetwork(Chain(Dense(Crux.dim(S)..., 128, relu), Dense(128, 128, relu), Dense(128, N_AGENTS, tanh))), zeros(Float32, N_AGENTS))
+V() = ContinuousNetwork(Chain(Dense(Crux.dim(O)..., 128, relu), Dense(128, 64, relu), Dense(64, 1)))
+SG() = GaussianPolicy(ContinuousNetwork(Chain(Dense(Crux.dim(O)..., 128, relu), Dense(128, 128, relu), Dense(128, N_AGENTS, tanh))), zeros(Float32, N_AGENTS))
 
-
-𝒮_ppo = PPO(π=ActorCritic(SG(), V()), S=Crux.state_space(continuous_env), N=100_000, ΔN=200, log=(period=1000,))
+𝒮_ppo = PPO(π=ActorCritic(SG(), V()), S=O, N=200_000, ΔN=4096)
 @time π_ppo = solve(𝒮_ppo, continuous_env)
 plot_learning(𝒮_ppo)
 

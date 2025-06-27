@@ -246,7 +246,6 @@ function POMDPs.actions(env::BoltzmannEnv)
     return Crux.DiscreteSpace(NUM_INDIVIDUAL_ACTIONS)  # Actions: 1=Stay, 2=North, 3=South, 4=East, 5=West
 end
 
-
 function POMDPs.observations(env::BoltzmannEnv)
     # Return a continuous space for observations
     observation_radius = env.observation_radius
@@ -356,12 +355,12 @@ O = observations(env_mdp)
 
 QS() = DiscreteNetwork(
     Chain(
-        Dense(Crux.dim(S)[1], 64, relu),
+        Dense(Crux.dim(O)[1], 64, relu),
         Dense(64, 64, relu),
         Dense(64, output_size)
     ), as)
 
-solver = DQN(π=QS(), S=Crux.state_space(env_mdp), N=200_000, buffer_size=10000, buffer_init=1000)
+solver = DQN(π=QS(), S=O, N=200_000, buffer_size=10000, buffer_init=1000)
 policy = solve(solver, env_mdp)
 plot_learning(solver)
 

@@ -22,7 +22,7 @@ function gini(wealths::Vector{Int})
 end
 
 ## 3. Model Properties
-function boltzmann_money_model(; num_agents=100, dims=(10, 10), seed=123, initial_wealth=1)
+function boltzmann_money_model(; num_agents=100, dims=(10, 10), seed=1234, initial_wealth=1)
     space = GridSpace(dims; periodic=true)
     rng = MersenneTwister(seed)
     properties = Dict(
@@ -38,7 +38,7 @@ function boltzmann_money_model(; num_agents=100, dims=(10, 10), seed=123, initia
     )
 
     for _ in 1:num_agents
-        add_agent_single!(BoltzmannAgent, model, initial_wealth)
+        add_agent_single!(BoltzmannAgent, model, rand(1:initial_wealth))
     end
     return model
 end
@@ -68,7 +68,13 @@ end
 
 
 ## 6. Example Simulation and Analysis
-model = boltzmann_money_model(num_agents=50, dims=(10, 10), initial_wealth=1)
+model = boltzmann_money_model(num_agents=5, dims=(10, 10), initial_wealth=10)
+figure, _ = abmplot(model;
+    agent_color=a -> a.wealth,
+    agent_size=a -> 8 + a.wealth * 0.5,
+    title="Boltzmann Money Model - Final State (Post-Simulation)"
+)
+figure
 
 adata = [:wealth]
 mdata = [:gini_coefficient]

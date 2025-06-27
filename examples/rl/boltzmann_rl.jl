@@ -56,7 +56,7 @@ function boltz_step!(agent::BoltzmannAgent, model::ABM, action::Int)
     # Wealth exchange
     others = [a for a in agents_in_position(agent.pos, model) if a.id != agent.id]
     if !isempty(others)
-        other = rand(getfield(model, :rng), others)
+        other = rand(others) #getfield(model, :rng),
         if other.wealth > agent.wealth && other.wealth > 0
             # Transfer wealth from other to agent
             agent.wealth += 1
@@ -75,8 +75,9 @@ end
 
 # Helper to convert model to BoltzmannState
 function model_to_state(model::ABM, step_count::Int)
-    wealths = [a.wealth for a in allagents(model)]
-    positions = [a.pos for a in allagents(model)]
+    sorted_agents = sort(collect(allagents(model)); by=a -> a.id)
+    wealths = [a.wealth for a in sorted_agents]
+    positions = [a.pos for a in sorted_agents]
     current_gini = gini(wealths)
     return BoltzmannState(wealths, positions, step_count, current_gini)
 end
@@ -102,7 +103,7 @@ function state_to_vector(s::BoltzmannState)::Vector{Float32}
 end
 
 ## 5. Custom MDP
-mutable struct BoltzmannEnv <: MDP{BoltzmannState,Vector{Int}}
+mutable struct BoltzmannEnv <: POMDP{BoltzmannState,Vector{Int},Vector{Float32}}
     abm_model::ABM
     num_agents::Int
     dims::Tuple{Int,Int}
@@ -113,7 +114,7 @@ mutable struct BoltzmannEnv <: MDP{BoltzmannState,Vector{Int}}
 end
 
 # Constructor for BoltzmannEnv 
-function BoltzmannEnv(; num_agents=50, dims=(10, 10), seed=123, initial_wealth=1, max_steps=200, gini_threshold=0.2)
+function BoltzmannEnv(; num_agents=50, dims=(10, 10), seed=1234, initial_wealth=1, max_steps=200, gini_threshold=0.2)
     rng = MersenneTwister(seed)
     env = BoltzmannEnv(
         boltzmann_money_model_rl_init(num_agents=num_agents, dims=dims, seed=seed, initial_wealth=initial_wealth),
@@ -142,7 +143,7 @@ function boltzmann_money_model_rl_init(; num_agents=100, dims=(10, 10), seed=123
     )
 
     for _ in 1:num_agents
-        add_agent_single!(BoltzmannAgent, model, rand(rng, 1:initial_wealth))
+        add_agent!(BoltzmannAgent, model, rand(rng, 1:initial_wealth)) #rng
     end
     wealths = [a.wealth for a in allagents(model)]
     model.gini_coefficient = gini(wealths)
@@ -156,12 +157,41 @@ function boltz_model_step!(model::ABM)
     model.step_count += 1
 end
 
-## 6. Implement POMDPs.jl Interface for BoltzmannEnv
-
+## 6. POMDPs.jl Interface for BoltzmannEnv
 const NUM_INDIVIDUAL_ACTIONS = 5 # Stay, N, S, E, W
 
 function POMDPs.actions(env::BoltzmannEnv)
     return 1:(NUM_INDIVIDUAL_ACTIONS^env.num_agents)
+end
+
+function POMDPs.observation(env::BoltzmannEnv, s::Vector{Float32})
+    # s is the full, unnormalized state vector from state_to_vector
+    n_agents = env.num_agents
+
+    # Determine normalization parameters from the environment
+    max_possible_wealth = Float32(env.initial_wealth * env.num_agents) # Total wealth is conserved
+    min_possible_wealth = Float32(0) # Wealth can go to 0
+
+    max_x = Float32(env.dims[1])
+    min_x = Float32(1) # GridSpace is 1-indexed
+    max_y = Float32(env.dims[2])
+    min_y = Float32(1)
+
+    normalized_obs = Vector{Float32}(undef, n_agents * 3) # Observation excludes step_count and Gini
+
+    for i in 1:n_agents
+        idx = 3 * (i - 1) + 1
+
+        # Normalize wealth
+        normalized_obs[idx] = (s[idx] - min_possible_wealth) / (max_possible_wealth - min_possible_wealth)
+
+        # Normalize x position
+        normalized_obs[idx+1] = (s[idx+1] - min_x) / (max_x - min_x)
+
+        # Normalize y position
+        normalized_obs[idx+2] = (s[idx+2] - min_y) / (max_y - min_y)
+    end
+    return normalized_obs
 end
 
 # Define the initial state of the MDP
@@ -169,11 +199,17 @@ function POMDPs.initialstate(env::BoltzmannEnv)
     env.abm_model = boltzmann_money_model_rl_init(
         num_agents=env.num_agents,
         dims=env.dims,
-        seed=1234,
+        seed=rand(env.rng, Int), #rand(env.rng, Int) 1234
         initial_wealth=env.initial_wealth
     )
     return Dirac(state_to_vector(model_to_state(env.abm_model, 0)))
 end
+
+function POMDPs.initialobs(env::BoltzmannEnv, initial_state)
+    obs = POMDPs.observation(env, initial_state)
+    return Dirac(obs)
+end
+
 
 # Define the transition function
 function POMDPs.transition(env::BoltzmannEnv, s, a::Vector{Int})
@@ -190,6 +226,16 @@ function POMDPs.transition(env::BoltzmannEnv, s, a::Vector{Int})
     # Return the new state
     next_state = state_to_vector(model_to_state(env.abm_model, env.abm_model.step_count))
     return next_state
+end
+
+function POMDPs.gen(env::BoltzmannEnv, state, action_idx::Int, rng::AbstractRNG)
+    #println(action_idx)
+    joint_action = int_to_joint_action(action_idx, env.num_agents)
+    #println("Joint action: ", joint_action)
+    next_state = POMDPs.transition(env, state, joint_action)
+    obs = POMDPs.observation(env, next_state)
+    r = POMDPs.reward(env, state, joint_action, next_state)
+    return (sp=next_state, o=obs, r=r)
 end
 
 # Define the reward function 
@@ -239,17 +285,8 @@ function joint_action_to_int(joint_action::Vector{Int})
     return action_idx + 1 # Convert to 1-indexed
 end
 
-
-function POMDPs.gen(env::BoltzmannEnv, state, action_idx::Int, rng::AbstractRNG)
-    #println(action_idx)
-    joint_action = int_to_joint_action(action_idx, env.num_agents)
-    #println("Joint action: ", joint_action)
-    next_state = POMDPs.transition(env, state, joint_action)
-    r = POMDPs.reward(env, state, joint_action, next_state)
-    return (sp=next_state, r=r)
-end
-
-Crux.state_space(env::BoltzmannEnv) = Crux.ContinuousSpace((env.num_agents * 3 + 2,)) # 3 values per agent: wealth, x, y + gini
+Crux.state_space(env::BoltzmannEnv) = Crux.ContinuousSpace((env.num_agents * 3 + 2,)) # 3 values per agent: wealth, x, y + gini and step
+POMDPs.observations(env::BoltzmannEnv) = Crux.ContinuousSpace((env.num_agents * 3,)) # Exclude step count and Gini from observations
 POMDPs.discount(env::BoltzmannEnv) = 0.99 # Discount factor
 
 
@@ -262,28 +299,28 @@ length(POMDPs.actions(env_mdp))
 rand(POMDPs.actions(env_mdp))
 
 S = Crux.state_space(env_mdp)
-Crux.dim(S)[1]
+O = Crux.observations(env_mdp)
 output_size = length(POMDPs.actions(env_mdp))
 as = [POMDPs.actions(env_mdp)...]
 
-
-
 QS() = DiscreteNetwork(
     Chain(
-        Dense(Crux.dim(S)[1], 64, relu),
+        Dense(Crux.dim(O)[1], 64, relu),
         Dense(64, 64, relu),
         Dense(64, output_size)
     ), as)
 
-solver = DQN(π=QS(), S=Crux.state_space(env_mdp), N=200_000, buffer_size=10000, buffer_init=1000)
+solver = DQN(π=QS(), S=O, N=200_000, buffer_size=10000, buffer_init=1000, ΔN=50)
 policy = solve(solver, env_mdp)
 plot_learning(solver)
 
 
-V() = ContinuousNetwork(Chain(Dense(Crux.dim(S)..., 64, relu), Dense(64, 64, relu), Dense(64, 1)))
-B() = DiscreteNetwork(Chain(Dense(Crux.dim(S)..., 64, relu), Dense(64, 64, relu), Dense(64, length(as))), as)
+V() = ContinuousNetwork(Chain(Dense(Crux.dim(O)..., 128, relu), Dense(128, 128, relu), Dense(128, 1)))
+B() = DiscreteNetwork(Chain(Dense(Crux.dim(O)..., 128, relu), Dense(128, 128, relu), Dense(128, length(as))), as)
 
-𝒮_ppo = PPO(π=ActorCritic(B(), V()), S=Crux.state_space(env_mdp), N=100_000, ΔN=100, log=(period=1000,))
+𝒮_ppo = PPO(π=ActorCritic(B(), V()), S=O, N=500_000, ΔN=500, λe=0.05f0,         # Increased entropy regularization for more exploration
+    a_opt=(optimizer=Adam(5e-5),), # Lower learning rate for the actor
+    c_opt=(optimizer=Adam(5e-5),)) # Lower learning rate for the critic)
 @time π_ppo = solve(𝒮_ppo, env_mdp)
 plot_learning(𝒮_ppo)
 
@@ -298,13 +335,16 @@ function run_policy_in_abm(π, env::BoltzmannEnv; max_steps=50)
 
     for step in 1:max_steps
         state_vec = state_to_vector(model_to_state(abm, step))
-        joint_action_idx = action(π, state_vec)
+        obs = POMDPs.observation(env, state_vec)
+        println(state_vec)
 
+        joint_action_idx = action(π, obs)
         # Convert action index to joint action
         joint_action = int_to_joint_action(joint_action_idx[1], env.num_agents)
 
         agents_by_id = sort(collect(allagents(abm)), by=a -> a.id)
         for (i, agent) in enumerate(agents_by_id)
+            println("Agent $(agent.id) action: ", joint_action[i])
             boltz_step!(agent, abm, joint_action[i])
         end
 
@@ -322,4 +362,4 @@ function run_policy_in_abm(π, env::BoltzmannEnv; max_steps=50)
 end
 
 # Run trained policy in a fresh ABM instance
-final_abm = run_policy_in_abm(π_ppo, env_mdp; max_steps=50)
+final_abm = run_policy_in_abm(policy, env_mdp; max_steps=50)
