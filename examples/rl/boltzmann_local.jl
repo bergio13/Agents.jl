@@ -239,7 +239,7 @@ function observation_to_vector(obs::LocalObservation)::Vector{Float32}
 end
 
 ## 6. Implement POMDPs.jl Interface for BoltzmannEnv
-const NUM_INDIVIDUAL_ACTIONS = 10 # Stay, N, S, E, W
+const NUM_INDIVIDUAL_ACTIONS = 5 # Stay, N, S, E, W
 
 function POMDPs.actions(env::BoltzmannEnv)
     return Crux.DiscreteSpace(NUM_INDIVIDUAL_ACTIONS)  # Actions: 1=Stay, 2=North, 3=South, 4=East, 5=West
