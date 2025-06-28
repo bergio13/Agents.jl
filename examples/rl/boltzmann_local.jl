@@ -156,8 +156,8 @@ end
 
 # Model Step Function 
 function boltz_model_step!(model::ABM)
-    wealths = [agent.wealth for agent in allagents(model)]
-    model.gini_coefficient = gini(wealths)
+    #wealths = [agent.wealth for agent in allagents(model)]
+    #model.gini_coefficient = gini(wealths)
     model.step_count += 1
 end
 
@@ -266,7 +266,7 @@ function POMDPs.initialstate(env::BoltzmannEnv)
     env.abm_model = boltzmann_money_model_rl_init(
         num_agents=env.num_agents,
         dims=env.dims,
-        seed=1234,
+        seed=rand(env.rng, Int),
         initial_wealth=env.initial_wealth
     )
     return Dirac(state_to_vector(model_to_state(env.abm_model, 0)))
@@ -278,29 +278,66 @@ function POMDPs.initialobs(env::BoltzmannEnv, initial_state::Vector{Float32})
     return Dirac(obs)
 end
 
-# Define the transition function
-function POMDPs.transition(env::BoltzmannEnv, s, a::Int)
-    agent = env.abm_model[env.current_agent_id]
-    boltz_step!(agent, env.abm_model, a)
-
-    # Update current agent (round-robin)
-    env.current_agent_id = (env.current_agent_id % env.num_agents) + 1
-
-    # If we've cycled through all agents, run model step
-    if env.current_agent_id == 1
-        boltz_model_step!(env.abm_model)
-    end
-
-    # Return the new state
-    next_state = state_to_vector(model_to_state(env.abm_model, env.abm_model.step_count))
-    return next_state
-end
+## Define the transition function
+#function POMDPs.transition(env::BoltzmannEnv, s, a::Int)
+#    agent = env.abm_model[env.current_agent_id]
+#    boltz_step!(agent, env.abm_model, a)
+#
+#    # Update current agent (round-robin)
+#    env.current_agent_id = (env.current_agent_id % env.num_agents) + 1
+#
+#    wealths = [a.wealth for a in allagents(env.abm_model)]
+#    env.abm_model.gini_coefficient = gini(wealths)
+#
+#    # If we've cycled through all agents, run model step
+#    if env.current_agent_id == 1
+#        boltz_model_step!(env.abm_model)
+#    end
+#
+#    # Return the new state
+#    next_state = state_to_vector(model_to_state(env.abm_model, env.abm_model.step_count))
+#    return next_state
+#end
 
 function POMDPs.gen(env::BoltzmannEnv, state, action::Int, rng::AbstractRNG)
     next_state = POMDPs.transition(env, state, action)
     observation = POMDPs.observation(env, next_state)
     r = POMDPs.reward(env, state, action, next_state)
     return (sp=next_state, o=observation, r=r)
+end
+
+function POMDPs.gen(env::BoltzmannEnv, s, action::Int, rng::AbstractRNG)
+    # 1. Calculate Gini BEFORE the agent moves
+    wealths_before = [a.wealth for a in allagents(env.abm_model)]
+    gini_before = gini(wealths_before)
+
+    # 2. The agent takes its action
+    agent = env.abm_model[env.current_agent_id]
+    boltz_step!(agent, env.abm_model, action)
+
+    # 3. Calculate Gini AFTER the agent moves
+    wealths_after = [a.wealth for a in allagents(env.abm_model)]
+    gini_after = gini(wealths_after)
+
+    # 4. Compute the reward based on the immediate change in Gini
+    # We reward a DECREASE in Gini, and we scale it up
+    r = (gini_before - gini_after) * 50
+
+    # Add a small penalty to discourage pointless actions
+    if r <= 0.0
+        r = -0.05
+    end
+
+    # 5. Advance the simulation state
+    env.current_agent_id = (env.current_agent_id % env.num_agents) + 1
+    if env.current_agent_id == 1
+        env.abm_model.step_count += 1
+    end
+
+    sp = state_to_vector(model_to_state(env.abm_model, env.abm_model.step_count))
+    o = observation(env, sp)
+
+    return (sp=sp, o=o, r=r)
 end
 
 # Define the reward function 
@@ -336,7 +373,7 @@ POMDPs.discount(env::BoltzmannEnv) = 0.99 # Discount factor
 
 
 # Setup the environment
-N_AGENTS = 10
+N_AGENTS = 5
 OBS_RADIUS = 2
 env_mdp = BoltzmannEnv(num_agents=N_AGENTS, dims=(10, 10), initial_wealth=10, max_steps=50, observation_radius=OBS_RADIUS)
 
@@ -362,6 +399,6 @@ plot_learning(solver)
 V() = ContinuousNetwork(Chain(Dense(Crux.dim(O)..., 64, relu), Dense(64, 64, relu), Dense(64, 1)))
 B() = DiscreteNetwork(Chain(Dense(Crux.dim(O)..., 64, relu), Dense(64, 64, relu), Dense(64, length(as))), as)
 
-𝒮_ppo = PPO(π=ActorCritic(B(), V()), S=O, N=100_000, ΔN=200, log=(period=1000,))
+𝒮_ppo = PPO(π=ActorCritic(B(), V()), S=O, N=200_000, ΔN=200, log=(period=1000,))
 @time π_ppo = solve(𝒮_ppo, env_mdp)
 plot_learning(𝒮_ppo)
