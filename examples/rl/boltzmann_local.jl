@@ -321,7 +321,10 @@ function POMDPs.gen(env::BoltzmannEnv, s, action::Int, rng::AbstractRNG)
 
     # 4. Compute the reward based on the immediate change in Gini
     # We reward a DECREASE in Gini, and we scale it up
-    r = (gini_before - gini_after) * 50
+    r = (gini_before - gini_after) * 100.0
+    if r > 0
+        r = r / (env.abm_model.step_count + 1)
+    end
 
     # Add a small penalty to discourage pointless actions
     if r <= 0.0
@@ -341,26 +344,26 @@ function POMDPs.gen(env::BoltzmannEnv, s, action::Int, rng::AbstractRNG)
 end
 
 # Define the reward function 
-function POMDPs.reward(env::BoltzmannEnv, s, a::Int, sp)
-    reward = 0.0
-    new_gini = sp[end] # Last element is the Gini coefficient
-    prev_gini = s[end] # Last element of the previous state
-
-    if new_gini < prev_gini
-        reward = (prev_gini - new_gini) * 20.0
-    else
-        reward = -0.05
-    end
-
-    if POMDPs.isterminal(env, sp)
-        if sp[end] < env.gini_threshold
-            reward += 50.0 / (sp[end-1] + 1)
-        elseif sp[end-1] >= env.max_steps
-            reward -= 1
-        end
-    end
-    return reward
-end
+#function POMDPs.reward(env::BoltzmannEnv, s, a::Int, sp)
+#    reward = 0.0
+#    new_gini = sp[end] # Last element is the Gini coefficient
+#    prev_gini = s[end] # Last element of the previous state
+#
+#    if new_gini < prev_gini
+#        reward = (prev_gini - new_gini) * 20.0
+#    else
+#        reward = -0.05
+#    end
+#
+#    if POMDPs.isterminal(env, sp)
+#        if sp[end] < env.gini_threshold
+#            reward += 50.0 / (sp[end-1] + 1)
+#        elseif sp[end-1] >= env.max_steps
+#            reward -= 1
+#        end
+#    end
+#    return reward
+#end
 
 # Define terminal states
 function POMDPs.isterminal(env::BoltzmannEnv, s)
@@ -373,9 +376,9 @@ POMDPs.discount(env::BoltzmannEnv) = 0.99 # Discount factor
 
 
 # Setup the environment
-N_AGENTS = 5
-OBS_RADIUS = 2
-env_mdp = BoltzmannEnv(num_agents=N_AGENTS, dims=(10, 10), initial_wealth=10, max_steps=50, observation_radius=OBS_RADIUS)
+N_AGENTS = 10
+OBS_RADIUS = 4
+env_mdp = BoltzmannEnv(num_agents=N_AGENTS, dims=(10, 10), initial_wealth=10, max_steps=50, observation_radius=OBS_RADIUS, gini_threshold=0.1)
 
 
 S = Crux.state_space(env_mdp)
@@ -402,3 +405,56 @@ B() = DiscreteNetwork(Chain(Dense(Crux.dim(O)..., 64, relu), Dense(64, 64, relu)
 𝒮_ppo = PPO(π=ActorCritic(B(), V()), S=O, N=200_000, ΔN=200, log=(period=1000,))
 @time π_ppo = solve(𝒮_ppo, env_mdp)
 plot_learning(𝒮_ppo)
+
+
+function run_policy_in_abm(π, env::BoltzmannEnv; max_steps=50)
+    # Initialize the ABM from the env
+    abm = boltzmann_money_model_rl_init(
+        num_agents=env.num_agents,
+        dims=env.dims,
+        seed=1234,
+        initial_wealth=env.initial_wealth
+    )
+
+    println("Initial Gini:", gini([a.wealth for a in allagents(abm)]))
+    # Update environment's abm_model reference
+    env.abm_model = abm
+
+    for step in 1:max_steps
+        # Process each agent in turn
+        agents_by_id = sort(collect(allagents(abm)), by=a -> a.id)
+
+        for agent in agents_by_id
+            # Update the environment's current agent
+            env.current_agent_id = agent.id
+
+            # Get observation for this specific agent
+            obs = POMDPs.observation(env, state_to_vector(model_to_state(abm, step)))
+
+            # Get action from policy
+            action_val = Crux.action(π, obs)
+
+            println("Agent $(agent.id) action: $action_val")
+
+            # Execute the action
+            boltz_step!(agent, abm, action_val[1])
+        end
+
+        # Update model step and recalculate Gini
+        boltz_model_step!(abm)
+        wealths = [a.wealth for a in allagents(abm)]
+        abm.gini_coefficient = gini(wealths)
+
+        println("Step $step | Gini: $(abm.gini_coefficient)")
+
+        if abm.gini_coefficient < env.gini_threshold
+            println("Reached Gini threshold.")
+            break
+        end
+    end
+
+    return abm
+end
+
+# Run trained policy in a fresh ABM instance
+final_abm = run_policy_in_abm(π_ppo, env_mdp; max_steps=50)
